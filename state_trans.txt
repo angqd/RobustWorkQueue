@@ -1,0 +1,51 @@
+STATES: PENDING, RESERVED, COMPLETED (terminal), DEAD (terminal)
+
+JOB FIELDS: id, payload, state, attempts, reserved_until
+TOKEN: attempt number. Token t is valid iff job.state == RESERVED and t == job.attempts.
+  attempts only ever increases, so an old token never matches a later lease.
+
+SEMANTICS
+- attempts increments once per reserve() (a job handed out = an attempt).
+- max_retries = retries after the first attempt, so a job gets max_retries + 1 attempts in total.
+  Exhausted means attempts > max_retries.
+- reject = no change to the job. Caller gets a rejection signal.
+- All operations run under one lock, validation and mutation in the same locked block.
+
+SWEEP (first step inside reserve(), runs under the lock)
+  For each RESERVED job with reserved_until <= now (lease expired):
+    attempts >  max_retries  -> DEAD
+    attempts <= max_retries  -> PENDING
+
+GUARD (first step in complete and fail)
+  job missing, or state != RESERVED, or token != job.attempts -> reject
+
+TRANSITIONS
+  submit()
+    queue full                         -> reject
+    otherwise                          -> new job PENDING, attempts 0
+
+  reserve()
+    PENDING job available (after sweep) -> RESERVED, attempts += 1, reserved_until = now + timeout,
+                                           return job + token
+    none available                      -> return None
+
+  complete(id, token)
+    guard passes                       -> COMPLETED
+    guard fails                        -> reject
+
+  fail(id, token)
+    guard passes, attempts <= max_retries -> PENDING
+    guard passes, attempts >  max_retries -> DEAD
+    guard fails                        -> reject
+
+REJECTED BY THE GUARD (state of job unchanged)
+  PENDING   + complete / fail
+  COMPLETED + complete / fail
+  DEAD      + complete / fail
+  RESERVED  + complete / fail with a stale token (lease expired and re-reserved)
+
+COMPLETED / DEAD + reserve(): these jobs are never candidates, so they are never returned.
+
+OPEN DECISIONS (settle in code)
+  - Is reject an exception or a False return?
+  - Does the capacity count PENDING + RESERVED only, or also terminal jobs?
