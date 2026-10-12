@@ -1,6 +1,8 @@
 from uuid import uuid4
 
-from work_queue import JobState, WorkQueue
+import pytest
+
+from work_queue import JobState, QueueFull, WorkQueue
 
 
 def reserve_one(queue: WorkQueue, payload: str = "a"):
@@ -31,8 +33,8 @@ def test_submit_rejects_when_full(queue):
         job_id = queue.submit(f"job{i}")
         assert job_id is not None
 
-    job_id = queue.submit(f"job4")
-    assert job_id is None
+    with pytest.raises(QueueFull):
+        queue.submit("job4")
 
 
 # --- reserve ---
@@ -74,7 +76,7 @@ def test_submit_correct_complete(queue):
     job_id = queue.submit("a")
     lease = queue.reserve()
     assert queue.complete(lease.job_id,lease.token) is True
-    assert queue._jobs[job_id].state is JobState.COMPLETED
+    assert job_id not in queue._jobs            # evicted on completion
 
 def test_complete_unknown_id_is_rejected(queue):
     assert queue.complete(uuid4(), 1) is False
@@ -83,6 +85,17 @@ def test_complete_wrong_token_is_rejected(queue):
     job_id, lease = reserve_one(queue)
     assert queue.complete(job_id, lease.token + 1) is False
     assert queue._jobs[job_id].state is JobState.RESERVED
+
+def test_late_complete_after_expiry_is_rejected(queue, clock):
+    job_id, lease = reserve_one(queue)
+    clock.advance(31)                       # past the 30s deadline, nobody re-reserved
+    assert queue.complete(job_id, lease.token) is False
+    assert queue._jobs[job_id].state is JobState.RESERVED
+
+def test_complete_exactly_at_deadline_is_rejected(queue, clock):
+    job_id, lease = reserve_one(queue)
+    clock.advance(30)
+    assert queue.complete(job_id, lease.token) is False
 
 def test_complete_pending_job_is_rejected(queue):
     job_id = queue.submit("a")                  # never reserved
@@ -102,7 +115,8 @@ def test_completed_job_is_never_reserved_again(queue):
 def test_complete_frees_capacity(queue):
     for i in range(3):
         queue.submit(f"job{i}")
-    assert queue.submit("overflow") is None     # full
+    with pytest.raises(QueueFull):              # full
+        queue.submit("overflow")
     lease = queue.reserve()
     queue.complete(lease.job_id, lease.token)
     assert queue.submit("fits now") is not None
@@ -138,7 +152,7 @@ def test_fail_completed_job_is_rejected(queue):
     job_id, lease = reserve_one(queue)
     queue.complete(job_id, lease.token)
     assert queue.fail(job_id, lease.token) is False
-    assert queue._jobs[job_id].state is JobState.COMPLETED
+    assert job_id not in queue._jobs
 
 
 # --- dead-letter queue ---

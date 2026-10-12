@@ -8,6 +8,10 @@ from uuid import UUID,uuid4
 
 
 
+class QueueFull(Exception):
+    """Raised by submit() when the queue has no free capacity."""
+
+
 class JobState(StrEnum):
     PENDING = "PENDING"
     RESERVED = "RESERVED"
@@ -31,6 +35,16 @@ class Lease:
 
 
 class WorkQueue:
+    """In-memory work queue with leases, retries and a dead-letter queue.
+
+    max_retries: retries after the first attempt, so a job gets at most
+        max_retries + 1 attempts. Once attempts exceed max_retries, the job is DEAD.
+    capacity: maximum number of active jobs (PENDING + RESERVED). Completed
+        and dead jobs do not count against it.
+    timeout: seconds a worker holds a lease before the job can be retried.
+    clock: returns the current time in seconds. Injected so tests can control time.
+    """
+
     def __init__(
         self,
         max_retries: int,
@@ -57,31 +71,40 @@ class WorkQueue:
         return count
 
     def _check_lease_locked(self,job_id,token)->Job|None:
-        # check valid job id 
-        if job_id in self._jobs and token == self._jobs[job_id].attempts:
-            job = self._jobs[job_id]
-            if(job.state == JobState.RESERVED):
-                return job
-            else:
-                return None
-        else:
+        # valid only while RESERVED, token matches the current attempt, and the deadline has not passed
+        job = self._jobs.get(job_id)
+        if job is None or job.state is not JobState.RESERVED:
             return None
+        if token != job.attempts:
+            return None
+        if self.clock() >= job.reserved_until:   # same boundary as the sweep: expired at <=
+            return None
+        return job
 
     def _sweep_locked(self):
-        return None # stub for now 
+        # start with dict and explore optimisations later
+        # analyse jobs via dict and change the states if needed 
+        for job in self._jobs.values():
+            if job.state == JobState.RESERVED and job.reserved_until<= self.clock():
+                if job.attempts <= self.max_retries:
+                    job.state = JobState.PENDING
+                    self._pending.append(job.id)
+                else: # failed 
+                    job.state = JobState.DEAD
+                    self._dlq.append(job)
+
     
 
-    def submit(self,payload:str):
-        # lock and check capacity
+    def submit(self,payload:str)->UUID:
+        """Add a PENDING job and return its id. Raises QueueFull if at capacity."""
         with self._lock:
-            if self._active_count_locked()< self.capacity :
-                    job_id = uuid4()
-                    job = Job(job_id,payload,JobState.PENDING,0,None)
-                    self._jobs[job_id] = job
-                    self._pending.append(job_id)
-                    return job_id
-            else:
-                return None # reject 
+            if self._active_count_locked() >= self.capacity:
+                raise QueueFull(f"queue at capacity ({self.capacity})")
+            job_id = uuid4()
+            job = Job(job_id,payload,JobState.PENDING,0,None)
+            self._jobs[job_id] = job
+            self._pending.append(job_id)
+            return job_id
 
         
         # create a job 
@@ -105,7 +128,8 @@ class WorkQueue:
         with self._lock:
             job = self._check_lease_locked(job_id,token)
             if job is not None:
-                job.state = JobState.COMPLETED
+                # evict: the job is done and nothing needs its record
+                del self._jobs[job_id]
                 return True
             else:
                 return False

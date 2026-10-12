@@ -17,7 +17,9 @@ SWEEP (first step inside reserve(), runs under the lock)
     attempts <= max_retries  -> PENDING
 
 GUARD (first step in complete and fail)
-  job missing, or state != RESERVED, or token != job.attempts -> reject
+  job missing, or state != RESERVED, or token != job.attempts,
+  or now >= reserved_until (lease expired)          -> reject
+  Expiry boundary matches the sweep: expired when reserved_until <= now.
 
 TRANSITIONS
   submit()
@@ -49,3 +51,4 @@ COMPLETED / DEAD + reserve(): these jobs are never candidates, so they are never
 OPEN DECISIONS (settle in code)
   - Is reject an exception or a False return?
   - Does the capacity count PENDING + RESERVED only, or also terminal jobs?
+  - Late complete after expiry: RESOLVED, rejected (the lease is a time-limited right).
